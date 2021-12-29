@@ -1,0 +1,13 @@
+Q: What is the time complexity for determining if a strike has occurred for a particular asset?
+
+A: as per the logic which I have written, for the first iteration the time complexity would be
+ O(n) which means time increases when the number of assets will increase. On the subsequent
+ iteration the time complexity of dictionary lookups would be constant O(1).
+
+
+Q: If we put this code into production, but found it too slow, or it needed to scale to many more
+users or more frequent strikes, what are the first things you would think of to speed it up?
+
+A: For the first thing which comes in my mind to increase the speed in production is to optimize the
+asset file size as bigger as possible corresponding to the working memory size.
+
