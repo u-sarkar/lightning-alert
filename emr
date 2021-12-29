@@ -1,0 +1,221 @@
+import json
+import logging
+import boto3
+from helpers import get_emr_cluster_settings
+from lib import convert_apps, convert_tags, get_emr_cluster_status
+
+logging.basicConfig(level=logging.INFO)
+
+emr_client = boto3.client('emr')
+
+
+def create_emr_cluster(type):
+    cluster_conf = get_emr_cluster_settings() if type == 'LONG_RUNNING' else \
+        get_emr_cluster_settings('emr-temp-conf.yaml')
+
+    applications = []
+    if 'applications' in cluster_conf:
+        applications.extend(convert_apps(cluster_conf['applications']))
+
+    tags = []
+    if 'tags' in cluster_conf:
+        tags.extend(convert_tags(cluster_conf['tags']))
+    tags.insert(0, {'Key': 'emr_type', 'Value': type})
+
+    ec2_key_name = cluster_conf['key_pair_name']
+    keep_job_flow_alive_when_no_steps = cluster_conf[
+        'keep_job_flow_alive_when_no_steps']
+    termination_protected = cluster_conf['termination_protected']
+    ec2_subnet_id = cluster_conf['subnet_id']
+    hadoop_version = cluster_conf['hadoop_version']
+    emr_managed_master_security_group = cluster_conf['master_security_groups'][
+        0]
+    emr_managed_slave_security_group = cluster_conf['slave_security_groups'][0]
+    additional_master_security_groups = cluster_conf['master_security_groups'][
+        1:]
+    additional_slave_security_groups = cluster_conf['slave_security_groups'][1:]
+
+    ebs_configuration = {
+        'EbsBlockDeviceConfigs': [{
+            'VolumeSpecification': {
+                'VolumeType': cluster_conf['ebs_volume_type'],
+                'SizeInGB': cluster_conf['ebs_volume_size']
+            },
+            'VolumesPerInstance': 1
+        }],
+        'EbsOptimized': True
+    }
+    auto_scaling_rules = []
+    if 'scaling' in cluster_conf:
+        for rule in cluster_conf['scaling']:
+            auto_scaling_rules.append({
+                'Description': '',
+                'Name': rule['name'],
+                'Action': {
+                    'SimpleScalingPolicyConfiguration': {
+                        'AdjustmentType': rule['adjustment_type'],
+                        'ScalingAdjustment': rule['adjustment'],
+                        'CoolDown': rule['cool_down']
+                    }
+                },
+                'Trigger': {
+                    'CloudWatchAlarmDefinition': {
+                        'ComparisonOperator': rule['cw_comparison_operator'],
+                        'EvaluationPeriods': rule['cw_evaluation_periods'],
+                        'MetricName': rule['cw_metric_name'],
+                        'Period': rule['cw_period'],
+                        'Threshold': rule['cw_threshold'],
+                        'Unit': rule['unit']
+                    }
+                }
+            })
+
+    auto_scaling_policy = {
+        'Constraints': {
+            'MinCapacity': cluster_conf['auto_scaling_min'],
+            'MaxCapacity': cluster_conf['auto_scaling_max']
+        },
+        'Rules': auto_scaling_rules
+    }
+
+    instance_groups = []
+    if cluster_conf['master_instance_count'] < 1:
+        raise KeyError('The cluster needs at least one master')
+
+    instance_group_master = {
+        'Name': cluster_conf['name'] + '-master',
+        'Market': 'ON_DEMAND',
+        'InstanceRole': 'MASTER',
+        'InstanceType': cluster_conf['master_instance_type'],
+        'InstanceCount': cluster_conf['master_instance_count'],
+        'EbsConfiguration': ebs_configuration,
+        'Configurations': []
+    }
+    instance_groups.append(instance_group_master)
+
+    if cluster_conf['core_instance_count'] > 0:
+        instance_group_core = {
+            'Name': cluster_conf['name'] + '-core',
+            'Market': 'ON_DEMAND',
+            'InstanceRole': 'CORE',
+            'InstanceType': cluster_conf['core_instance_type'],
+            'InstanceCount': cluster_conf['core_instance_count'],
+            'EbsConfiguration': ebs_configuration,
+            'AutoScalingPolicy': auto_scaling_policy,
+            'Configurations': []
+        }
+        instance_groups.append(instance_group_core)
+    if cluster_conf['task_instance_count'] > 0:
+        instance_group_task = {
+            'Name': cluster_conf['name'] + '-task',
+            'Market': 'ON_DEMAND',
+            'InstanceRole': 'TASK',
+            'InstanceType': cluster_conf['task_instance_type'],
+            'InstanceCount': cluster_conf['task_instance_count'],
+            'EbsConfiguration': ebs_configuration,
+            'AutoScalingPolicy': auto_scaling_policy,
+            'Configurations': []
+        }
+        instance_groups.append(instance_group_task)
+
+    instances = {
+        'InstanceGroups': instance_groups,
+        'Ec2KeyName': ec2_key_name,
+        'Placement': {},
+        'InstanceFleets': [],
+        'HadoopVersion': hadoop_version,
+        'KeepJobFlowAliveWhenNoSteps': keep_job_flow_alive_when_no_steps,
+        'TerminationProtected': termination_protected,
+        'Ec2SubnetId': ec2_subnet_id,
+        'EmrManagedMasterSecurityGroup': emr_managed_master_security_group,
+        'EmrManagedSlaveSecurityGroup': emr_managed_slave_security_group,
+        'AdditionalMasterSecurityGroups': additional_master_security_groups,
+        'AdditionalSlaveSecurityGroups': additional_slave_security_groups
+    }
+    if cluster_conf.get('service_access_security_group'):
+        instances['ServiceAccessSecurityGroup'] = cluster_conf.get(
+            'service_access_security_group')
+
+    steps = [{
+        "ActionOnFailure": "TERMINATE_JOB_FLOW",
+        "HadoopJarStep": {
+            "Args": ["state-pusher-script"],
+            "Jar": "command-runner.jar",
+            "Properties": []
+        },
+        "Name": "Setup hadoop debugging"
+    }]
+
+    cluster = emr_client.run_job_flow(
+        Name=cluster_conf['name'],
+        Configurations=[],
+        LogUri=cluster_conf['log_uri'],
+        ReleaseLabel=cluster_conf['release_label'],
+        Instances=instances,
+        VisibleToAllUsers=True,
+        Applications=applications,
+        JobFlowRole=cluster_conf['instance_role'],
+        ServiceRole=cluster_conf['service_role'],
+        Steps=steps,
+        BootstrapActions=[],
+        Tags=tags,
+        AutoScalingRole=cluster_conf['auto_scaling_role'],
+        EbsRootVolumeSize=10)
+    # CustomAmiId=cluster_conf['custom_ami_id'])
+    return cluster['JobFlowId']
+
+
+def lambda_handler(event, context):
+    """ Endpoint to create an EMR cluster based on YAML conf """
+    try:
+        data = json.loads(event['body'])
+    except TypeError:
+        data = event['body']
+    if 'type' not in data or not data.get('type'):
+        logging.error('Validation Failed')
+        return {
+            'statusCode': 400,
+            'body': json.dumps({
+                'code': 'BAD_REQUEST',
+                'message': 'type is a required field',
+            }),
+            'headers': {
+                'Access-Control-Allow-Origin': '*',
+            },
+            'isBase64Encoded': False,
+        }
+    if data['type'] not in ['LONG_RUNNING', 'TRANSIENT']:
+        logging.error('Invalid Value')
+        return {
+            'statusCode': 400,
+            'body': json.dumps({
+                'code': 'BAD_REQUEST',
+                'message': 'invalid value',
+            }),
+            'headers': {
+                'Access-Control-Allow-Origin': '*',
+            },
+            'isBase64Encoded': False,
+        }
+
+    cluster_id = create_emr_cluster(data['type'])
+    cluster_status = get_emr_cluster_status(emr_client, cluster_id)
+    to_return = {
+        "clusterId": cluster_id,
+        "type": data.get('type'),
+        "status": cluster_status['status']
+    }
+    if cluster_status.get('message'):
+        to_return['error'] = {'message': cluster_status.get('message')}
+    if cluster_status.get('code'):
+        to_return['error'] = {'code': cluster_status.get('code')}
+
+    response = {
+        'statusCode': 200,
+        'body': json.dumps(to_return),
+        'isBase64Encoded': False,
+        'headers': {
+            'Access-Control-Allow-Origin': '*',
+        },
+    }
+    return response
